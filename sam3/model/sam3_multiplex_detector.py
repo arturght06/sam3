@@ -321,10 +321,13 @@ class Sam3MultiplexDetector(Sam3MultiplexImageBase):
         async_all_gather=True,
         gather_backbone_out=None,
         is_multiplex=False,
+        detection_interval=1,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self.detection_interval = detection_interval
         self.rank = int(os.getenv("RANK", "0"))
+
         self.world_size = int(os.getenv("WORLD_SIZE", "1"))
         self.async_all_gather = async_all_gather
 
@@ -496,19 +499,75 @@ class Sam3MultiplexDetector(Sam3MultiplexImageBase):
         """Compute FA outputs on a chunk of frames and store their results in multigpu_buffer."""
         # each GPU computes FA on one frame in the chunk (in a round-robin manner)
         frame_idx_local_gpu = min(frame_idx_begin + self.rank, frame_idx_end - 1)
-        # `forward_grounding` (from base class `Sam3MultiplexImageBase`) runs FA on a single frame
-        with torch.profiler.record_function("forward_grounding"):
-            out_local = self.forward_grounding(
-                backbone_out=backbone_out,
-                # HACK: Since find_inputs is on GPU having to realloc is expensive so changing the values in place for the prod usecase
-                # i.e. when using the streaming frame loader resource instead of local file. For non-prod is always
-                # frame_idx_local_gpu < len(find_inputs) so should be a no-op
-                find_input=find_inputs[frame_idx_local_gpu % len(find_inputs)],
-                find_target=None,
-                geometric_prompt=geometric_prompt,
-                feature_cache=feature_cache,
-            )
-        if run_nms:
+        
+        start_frame_idx = 0
+        if feature_cache is not None and "tracking_bounds" in feature_cache:
+            start_val = feature_cache["tracking_bounds"].get("propagate_in_video_start_frame_idx", 0)
+            if start_val is not None:
+                start_frame_idx = start_val
+        
+        detection_interval = getattr(self, "detection_interval", 1)
+        
+        is_start_frame = (frame_idx_local_gpu == start_frame_idx)
+        should_detect = is_start_frame or (detection_interval <= 1) or ((frame_idx_local_gpu - start_frame_idx) % detection_interval == 0)
+
+
+        if should_detect:
+            # `forward_grounding` (from base class `Sam3MultiplexImageBase`) runs FA on a single frame
+            with torch.profiler.record_function("forward_grounding"):
+                out_local = self.forward_grounding(
+                    backbone_out=backbone_out,
+                    # HACK: Since find_inputs is on GPU having to realloc is expensive so changing the values in place for the prod usecase
+                    # i.e. when using the streaming frame loader resource instead of local file. For non-prod is always
+                    # frame_idx_local_gpu < len(find_inputs) so should be a no-op
+                    find_input=find_inputs[frame_idx_local_gpu % len(find_inputs)],
+                    find_target=None,
+                    geometric_prompt=geometric_prompt,
+                    feature_cache=feature_cache,
+                )
+        else:
+            with torch.profiler.record_function("forward_grounding_skip_detection"):
+                find_input = find_inputs[frame_idx_local_gpu % len(find_inputs)]
+                img_batch = backbone_out["img_batch_all_stages"]
+                local_idx = frame_idx_local_gpu % len(find_inputs)
+                if isinstance(img_batch, torch.Tensor):
+                    image = img_batch[[local_idx]]
+                else:
+                    image = img_batch[local_idx].unsqueeze(0)
+                image = image.to(dtype=torch.float32, device=self.device)
+                
+                backbone_kwargs = {}
+                if isinstance(self.backbone, SAM3VLBackboneTri):
+                    backbone_kwargs = {
+                        "need_sam3_out": False,
+                        "need_interactive_out": self.is_multiplex,
+                        "need_propagation_out": True,
+                    }
+                
+                with torch.no_grad():
+                    backbone_feats = self.backbone.forward_image(image, **backbone_kwargs)
+                
+                num_prompts = find_input.text_ids.size(0)
+                num_queries = self.transformer.decoder.num_queries
+                device = self.device
+                
+                pred_logits = torch.full((num_prompts, num_queries, 1), -10000.0, device=device)
+                pred_boxes = torch.zeros((num_prompts, num_queries, 4), device=device)
+                pred_boxes_xyxy = torch.zeros((num_prompts, num_queries, 4), device=device)
+                pred_masks = torch.full((num_prompts, num_queries, 256, 256), -10.0, device=device)
+                
+                out_local = {
+                    "pred_logits": pred_logits,
+                    "pred_boxes": pred_boxes,
+                    "pred_boxes_xyxy": pred_boxes_xyxy,
+                    "pred_masks": pred_masks,
+                    "pred_object_ids": torch.full((num_prompts, num_queries), -1, dtype=torch.long, device=device),
+                    "prev_encoder_out": {
+                        "backbone_out": backbone_feats
+                    }
+                }
+
+        if should_detect and run_nms:
             with torch.profiler.record_function("nms_masks"):
                 # run NMS as a post-processing step on top of the detection outputs
                 assert nms_prob_thresh is not None and nms_iou_thresh is not None
@@ -527,6 +586,7 @@ class Sam3MultiplexDetector(Sam3MultiplexImageBase):
                     )
                     # set a very low threshold for those detections removed by NMS
                     out_local["pred_logits"][prompt_idx, :, 0] -= 1e4 * (~keep).float()
+
 
         if self.gather_backbone_out:
             # gather the SAM 2 backbone features across GPUs

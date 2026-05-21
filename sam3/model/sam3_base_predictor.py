@@ -129,6 +129,11 @@ class Sam3BasePredictor:
             offload_video_to_cpu=offload_video_to_cpu,
             offload_state_to_cpu=offload_state_to_cpu,
         )
+        import inspect
+        sig = inspect.signature(self.model.init_state)
+        if "offload_state_to_cpu" not in sig.parameters:
+            init_kwargs.pop("offload_state_to_cpu", None)
+        
         if hasattr(self, "async_loading_frames"):
             init_kwargs["async_loading_frames"] = self.async_loading_frames
         if hasattr(self, "video_loader_type"):

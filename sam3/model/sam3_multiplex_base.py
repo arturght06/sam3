@@ -256,6 +256,7 @@ class Sam3MultiplexBase(Sam3VideoBase):
         running_in_prod=False,  # Flag to specify if we are running in FBInfra for Insta Edit/Segments
         use_batched_grounding=False,
         batched_grounding_batch_size=1,
+        detection_interval=1,
         **kwargs,
     ):
         nn.Module.__init__(self)
@@ -278,6 +279,9 @@ class Sam3MultiplexBase(Sam3VideoBase):
         self.is_multiplex = is_multiplex
         self.running_in_prod = running_in_prod
         self.detector.running_in_prod = running_in_prod
+        self.detection_interval = detection_interval
+        self.detector.detection_interval = detection_interval
+
 
         assert (
             self.is_multiplex == self.tracker.is_multiplex == self.detector.is_multiplex
@@ -497,6 +501,8 @@ class Sam3MultiplexBase(Sam3VideoBase):
           it contains both global and local masklet information
         """
 
+        import time
+        t0 = time.time()
         # Step 1: run backbone and FA in a distributed manner -- this is done via Sam3MultiplexDetector,
         # a distributed FA model (assigned to `self.detector`) that shards frames in a round-robin manner.
         # It returns a "det_out" dict for `frame_idx` and fills SAM2 backbone features for `frame_idx`
@@ -513,6 +519,7 @@ class Sam3MultiplexBase(Sam3VideoBase):
                 use_batched_grounding=self.use_batched_grounding,
                 batched_grounding_batch_size=self.batched_grounding_batch_size,
             )
+        t1 = time.time()
 
         # Step 2: each GPU propagates its local SAM2 states to get the SAM2 prediction masks.
         # the returned `tracker_low_res_masks_global` contains the concatenated masklet predictions
@@ -532,14 +539,19 @@ class Sam3MultiplexBase(Sam3VideoBase):
                     tracker_metadata_prev=tracker_metadata_prev,
                 )
             )
+        t2 = time.time()
 
         with torch.profiler.record_function("GPU sync and filter"):
             # Remove leading dimension (assumes batch size 1)
             assert pos_pred_mask.shape[0] == 1
             pos_pred_mask = pos_pred_mask.squeeze(0)
             det_out = {k: det_out[k][0] for k in det_out}
-            # Move detections we'll actually keep at the top for future logic
-            pos_pred_mask_idx = pos_pred_mask.argsort(descending=True)
+            # Filter and sort to keep only positive detections above threshold
+            pos_pred_mask_idx = torch.where(pos_pred_mask)[0]
+            if pos_pred_mask_idx.numel() > 0:
+                scores = det_out["scores"][pos_pred_mask_idx]
+                sort_idx = scores.argsort(descending=True)
+                pos_pred_mask_idx = pos_pred_mask_idx[sort_idx]
             pos_pred_mask = torch.index_select(
                 pos_pred_mask, dim=0, index=pos_pred_mask_idx
             )
@@ -570,6 +582,7 @@ class Sam3MultiplexBase(Sam3VideoBase):
                     is_image_only=is_image_only,
                 )
             )
+        t3 = time.time()
 
         # Get reconditioning info from the update plan
         reconditioned_obj_ids = sam2_update_plan.get("reconditioned_obj_ids", set())
@@ -591,6 +604,7 @@ class Sam3MultiplexBase(Sam3VideoBase):
                 orig_vid_width=orig_vid_width,
                 feature_cache=feature_cache,
             )
+        t4 = time.time()
 
         # Step 5: finally, build the outputs for this frame (it only needs to be done on GPU 0 since
         # only GPU 0 will send outputs to the server).
@@ -613,6 +627,12 @@ class Sam3MultiplexBase(Sam3VideoBase):
                 obj_id_to_score = tracker_metadata_new["obj_id_to_score"]
             else:
                 obj_id_to_mask, obj_id_to_score = {}, {}  # dummy outputs on other GPUs
+        t5 = time.time()
+
+        # Print step timings for optimization analysis
+        if self.rank == 0:
+            print(f"[Profiling Frame {frame_idx:02d}] Det: {t1-t0:.4f}s | Prop: {t2-t1:.4f}s | Plan: {t3-t2:.4f}s | Exec: {t4-t3:.4f}s | Out: {t5-t4:.4f}s | Total: {t5-t0:.4f}s")
+
         # a few statistics for the current frame as a part of the output
         frame_stats = {
             "num_obj_tracked": np.sum(tracker_metadata_new["num_obj_per_gpu"]),

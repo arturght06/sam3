@@ -15,7 +15,12 @@ def flash_attn_func_op(
 
 
 def flash_attn_func(q, k, v):
-    dtype = torch.float8_e4m3fn
+    dtype = q.dtype
+    if dtype == torch.float32:
+        dtype = torch.bfloat16
+    # if Hopper or newer, can use float8 if desired, else use q.dtype
+    if torch.cuda.get_device_properties(0).major >= 9:
+        dtype = torch.float8_e4m3fn
     return flash_attn_func_op(q.to(dtype), k.to(dtype), v.to(dtype)).to(q.dtype)
 
 
